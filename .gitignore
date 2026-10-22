@@ -1,0 +1,7 @@
+.DS_Store
+*.hex
+*.elf
+*.bin
+build/
+credentials.h
+secrets.h

@@ -1,6 +1,6 @@
 # CLEAR ENES100 software
 
-Arduino C++ starter for Mahrus and Matt. The current sketch controls the **course practice tank** (Arduino Mega), not the final UNO R4 WiFi vehicle. Keep this repository private while the team iterates.
+Arduino C++ starter for Mahrus and Matt. The current sketch controls the **course practice tank** (Arduino Mega), not the final UNO R4 WiFi vehicle. This repository is currently public; change visibility in GitHub settings if the team wants access limited to collaborators.
 
 ## Install on each teammate's computer
 

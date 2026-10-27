@@ -33,10 +33,17 @@ const float GOAL_Y = 1.5;
 
 // Ultrasonic thresholds (meters, measured from the front of the robot).
 const float LOOK_DIST = 0.45;  // lane counts as blocked if something is this close
-const float STOP_DIST = 0.25;  // stop driving if something gets this close
+const float STOP_DIST = 0.30;  // stop driving if something gets this close
+const float SLOW_DIST = 0.70;  // slow down when something is this close
 
 // Motor tuning (simulator values; the real tank needs more turn power).
 const int DRIVE_PWM = 110;
+const int SLOW_PWM = 60;
+const int PULSE_TURN_PWM = 60;
+// Simulator motion model: speed = (L+R)/255/4 m/s, turn rate = (R-L)/255 rad/s.
+// On the real tank, measure these and replace them.
+const float SLOW_M_PER_SEC = 2.0 * SLOW_PWM / 255.0 / 4.0;
+const float TURN_RAD_PER_SEC = 2.0 * PULSE_TURN_PWM / 255.0;
 const int TURN_MIN_PWM = 45;
 const int TURN_MAX_PWM = 85;
 
@@ -89,13 +96,35 @@ float frontDistance() {
   return d;
 }
 
+// Run the motors for a fixed time, then stop. delay() is real time, so this
+// works no matter how slowly the simulator steps through the code.
+void timedMove(int left, int right, float seconds) {
+  if (!ENABLE_MOTION) return;
+  Tank.setLeftMotorPWM(left);
+  Tank.setRightMotorPWM(right);
+  delay((int)(seconds * 1000));
+  Tank.turnOffMotors();
+}
+
 // Spin in place toward a heading. Returns true once facing it.
 bool turnToward(float desired, float theta) {
   float error = angleError(desired, theta);
-  if (fabs(error) < 0.08) {
+  if (fabs(error) < 0.06) {
     cmdLeft = 0;
     cmdRight = 0;
     return true;
+  }
+  if (fabs(error) < 0.6) {
+    // Small turn: timed pulse so we don't overshoot between loops.
+    float seconds = fabs(error) / TURN_RAD_PER_SEC;
+    if (error > 0) {
+      timedMove(-PULSE_TURN_PWM, PULSE_TURN_PWM, seconds);
+    } else {
+      timedMove(PULSE_TURN_PWM, -PULSE_TURN_PWM, seconds);
+    }
+    cmdLeft = 0;
+    cmdRight = 0;
+    return false;
   }
   float mag = fabs(error);
   if (mag > 1.0) mag = 1.0;
@@ -111,27 +140,36 @@ bool turnToward(float desired, float theta) {
 }
 
 // Drive while holding a heading; steers proportionally.
-void driveHeading(float desired, float theta) {
+void driveHeading(float desired, float theta, int pwm) {
   float error = angleError(desired, theta);
   if (fabs(error) > 0.5) {
     turnToward(desired, theta);
     return;
   }
-  int steer = (int)(80 * error);
-  cmdLeft = DRIVE_PWM - steer;
-  cmdRight = DRIVE_PWM + steer;
+  int steer = (int)(pwm * 0.7 * error);
+  cmdLeft = pwm - steer;
+  cmdRight = pwm + steer;
 }
 
 // Drive to a point. Returns true when within tol.
 bool driveToPoint(float tx, float ty, float tol, float x, float y, float theta) {
   float dx = tx - x;
   float dy = ty - y;
-  if (sqrt(dx * dx + dy * dy) < tol) {
+  float dist = sqrt(dx * dx + dy * dy);
+  if (dist < tol) {
     cmdLeft = 0;
     cmdRight = 0;
     return true;
   }
-  driveHeading(atan2(dy, dx), theta);
+  float desired = atan2(dy, dx);
+  if (dist < 0.3) {
+    // Close: face the point, then a timed straight move onto it.
+    if (turnToward(desired, theta)) {
+      timedMove(SLOW_PWM, SLOW_PWM, dist / SLOW_M_PER_SEC);
+    }
+    return false;
+  }
+  driveHeading(desired, theta, DRIVE_PWM);
   return false;
 }
 
@@ -242,7 +280,9 @@ void loop() {
       setState(ST_CHECK);
     } else {
       // Aim slightly ahead on the lane center so drift gets corrected.
-      driveHeading(atan2(laneY(lane) - y, 0.3), theta);
+      int pwm = DRIVE_PWM;
+      if (front < SLOW_DIST) pwm = SLOW_PWM;
+      driveHeading(atan2(laneY(lane) - y, 0.3), theta, pwm);
     }
   } else if (state == ST_TO_GOAL) {
     if (driveToPoint(GOAL_X, GOAL_Y, 0.10, x, y, theta)) {

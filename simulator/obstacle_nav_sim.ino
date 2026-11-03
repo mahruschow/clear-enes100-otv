@@ -2,18 +2,20 @@
 // Paste this whole file into https://enes100.umd.edu/tools/simulator/
 //
 // Logic:
-//   1. Face forward (+x) and drive forward.
-//   2. If the front sensor sees an object, stop and turn in small steps
-//      until the sensor sees an opening (nothing within 1 m). Try the side
-//      toward the middle of the arena first, then the other side.
-//   3. Slide sideways to line up with the opening, turn back to face
-//      forward, and keep driving.
+//   1. Face forward (+x) and drive forward, checking the front sensor
+//      continuously while the motors run.
+//   2. When an object is close ahead, stop and slowly turn while watching
+//      the sensor until it sees an opening (nothing within 1 m) and then
+//      where the opening ends. Try the side toward the middle first.
+//   3. Slide sideways to the middle of the opening, face forward, repeat.
 //   4. Once past the obstacles, line up with the limbo and drive under it.
 //
-// Each move is motors on -> delay -> motors off. The simulator runs code
-// slowly, so motors stay on a bit longer than asked. The code measures that
-// extra time after every move and subtracts it from the next one, so it
-// doesn't overshoot and wobble back and forth.
+// Striped blocks are rumble strips: the course expects you to drive over
+// them, and the sensor can't see them.
+//
+// Every move is "motors on, then a tight loop that watches the sensor /
+// position, then motors off" so the tank reacts within a few centimeters
+// even though the simulator runs code slowly.
 #include <math.h>
 #include "Arduino.h"
 #include "Enes100.h"
@@ -22,8 +24,6 @@
 // Marker ID and room number are ignored by the simulator.
 const int MARKER_ID = 3;
 const int ROOM_NUMBER = 1116;
-
-const bool ENABLE_MOTION = true;
 
 // Arena is 4 m x 2 m. Once x passes this, all obstacles are behind us.
 const float CLEAR_X = 2.7;
@@ -42,73 +42,37 @@ const float GOAL_X = 3.7;
 
 // Front sensor distances (meters, from the front of the robot).
 const float DETECT_DIST = 0.42;  // object this close ahead -> stop and look for an opening
-const float STOP_DIST = 0.25;    // never drive closer than this
+const float OPEN_DIST = 1.0;     // sensor sees nothing within this -> opening
+const float CONFIRM_DIST = 0.6;  // still part of the opening while farther than this
 
-// Scanning for an opening.
-const float SCAN_STEP = 0.2;     // radians per scan turn (~11 degrees)
+// Scanning / side-stepping.
 const float SCAN_MAX = 1.1;      // farthest we turn from forward (~63 degrees)
-const float CONFIRM_DIST = 0.6;  // still "open" while the sensor reads farther than this
-const float SIDE_MARGIN = 0.2;   // extra sideways distance past the object's edge
+const float SIDE_MARGIN = 0.2;   // extra sideways distance past an opening's edge
 const float BLIND_SIDESTEP = 0.5; // slide this far when no opening is in view
 const float MIN_SIDE_Y = 0.35;   // stay this far from the side walls
 const float MAX_SIDE_Y = 1.65;
 
-// Tolerances / step size.
-const float HEADING_TOL = 0.12;  // radians (~7 degrees)
-const float Y_TOL = 0.08;        // meters
-const float SIDE_TOL = 0.04;     // meters, when lining up with an opening
-const float MAX_STEP = 0.45;     // longest single straight move, meters
+// Tolerances.
+const float HEADING_TOL = 0.05;  // radians (~3 degrees)
+const float POS_TOL = 0.02;      // meters
 
-// Motor tuning (simulator values; the real tank needs its own numbers).
-const int DRIVE_PWM = 220;
-const int TURN_PWM = 150;
-// Simulator motion model: speed = (L+R)/255/4 m/s, turn rate = (R-L)/255 rad/s.
-// On the real tank, measure these two and replace them.
-const float DRIVE_M_PER_SEC = 2.0 * DRIVE_PWM / 255.0 / 4.0;
-const float TURN_RAD_PER_SEC = 2.0 * TURN_PWM / 255.0;
-const float MIN_MOVE_SEC = 0.05;
+// Motor power (simulator values; tune for the real tank).
+const int DRIVE_PWM = 255;
+const int SLOW_PWM = 90;         // last few cm of a move
+const int TURN_PWM = 180;
+const int FINE_TURN_PWM = 60;    // last few degrees of a turn
+const int SCAN_PWM = 110;        // slow sweep while looking for an opening
+const float STEER_GAIN = 120;    // PWM difference per radian of heading error
 
-#define ST_FACE_FORWARD 0
-#define ST_DRIVE 1
-#define ST_SCAN 2
-#define ST_SIDESTEP 3
-#define ST_TO_LIMBO_Y 4
-#define ST_FACE_LIMBO 5
-#define ST_UNDER_LIMBO 6
-#define ST_DONE 7
+// Results from driveForward().
+#define REACHED 0
+#define BLOCKED 1
+#define STUCK 2
 
-int state = ST_FACE_FORWARD;
-
-// Scan state.
-int scanDir = 1;           // +1 = turning toward +y, -1 = toward -y
-int scanSidesTried = 0;
-int scanFirstDir = 1;      // side tried first in the current scan
-float scanAngle = 0;       // current scan heading relative to forward
-bool scanSawOpen = false;  // currently turning through an opening
-
-// Side-step state.
-float objectDist = 0;      // front reading when the object was detected
-float openAngle = 0;       // first scan heading that was clear
-float openEndAngle = 0;    // last scan heading that was still clear
-float sideTargetY = 0;     // y to side-step to so we line up with the opening
+bool done = false;
 float holdY = 0;           // y line to hold while driving forward
-int sideMoves = 0;         // drive moves made in the current side-step
-
-bool halted = false;
-int loopCount = 0;
-
-// Learned extra motor-on time per move (seconds), and the last move made,
-// so the next loop can measure how far it really went.
-float extraSec = 0.15;
-int lastMoveKind = 0;      // 0 none, 1 turn, 2 drive
-float lastMoveSec = 0;
-float lastMoveRate = 0;
-float moveStartX = 0;
-float moveStartY = 0;
-float moveStartTheta = 0;
-int stuckCount = 0;
-int recoveries = 0;        // times we backed up to get unstuck
-const int MAX_RECOVERIES = 6;
+int recoveries = 0;
+const int MAX_RECOVERIES = 8;
 
 float angleError(float desired, float current) {
   return atan2(sin(desired - current), cos(desired - current));
@@ -122,170 +86,203 @@ float frontDistance() {
   return d;
 }
 
-// Run the motors for a fixed time, then stop.
-void timedMove(int left, int right, float seconds) {
-  if (!ENABLE_MOTION) return;
+void setMotors(int left, int right) {
+  if (left > 255) left = 255;
+  if (left < -255) left = -255;
+  if (right > 255) right = 255;
+  if (right < -255) right = -255;
   Tank.setLeftMotorPWM(left);
   Tank.setRightMotorPWM(right);
-  delay((int)(seconds * 1000));
+}
+
+void stopMotors() {
   Tank.turnOffMotors();
 }
 
-// Pick power and time for a move of `amount` (radians or meters) at full
-// `pwm` / `fullRate`, accounting for the learned extra time. Small moves use
-// lower power so the extra time doesn't overshoot them.
-int planPwm = 0;
-float planSec = 0;
-float planRate = 0;
-void planMove(float amount, int pwm, float fullRate) {
-  float sec = amount / fullRate - extraSec;
-  if (sec >= MIN_MOVE_SEC) {
-    planPwm = pwm;
-    planSec = sec;
-    planRate = fullRate;
-    return;
+void finish(const char *reason) {
+  stopMotors();
+  Enes100.println(reason);
+  done = true;
+}
+
+// Turn in place until facing `desired`. Slows down for the last few degrees.
+void turnTo(float desired) {
+  unsigned long start = millis();
+  float err = angleError(desired, Enes100.getTheta());
+  while (fabs(err) > HEADING_TOL && millis() - start < 8000) {
+    int pwm = TURN_PWM;
+    if (fabs(err) < 0.35) pwm = FINE_TURN_PWM;
+    if (err > 0) {
+      setMotors(-pwm, pwm);
+    } else {
+      setMotors(pwm, -pwm);
+    }
+    err = angleError(desired, Enes100.getTheta());
   }
-  float rate = amount / (MIN_MOVE_SEC + extraSec);
-  planPwm = (int)(pwm * rate / fullRate);
-  if (planPwm < 20) planPwm = 20;
-  planRate = fullRate * planPwm / pwm;
-  planSec = MIN_MOVE_SEC;
+  stopMotors();
 }
 
-void rememberMove(int kind, float x, float y, float theta) {
-  lastMoveKind = kind;
-  lastMoveSec = planSec;
-  lastMoveRate = planRate;
-  moveStartX = x;
-  moveStartY = y;
-  moveStartTheta = theta;
-}
-
-// One timed turn toward a heading. Returns true if already facing it.
-bool turnTo(float desired, float x, float y, float theta) {
-  float error = angleError(desired, theta);
-  if (fabs(error) < HEADING_TOL) return true;
-  planMove(fabs(error), TURN_PWM, TURN_RAD_PER_SEC);
-  rememberMove(1, x, y, theta);
-  if (error > 0) {
-    timedMove(-planPwm, planPwm, planSec);
-  } else {
-    timedMove(planPwm, -planPwm, planSec);
+// Drive forward (+x) holding the line y = holdY until x reaches stopX.
+// If useSensor, stops early when something is within DETECT_DIST.
+int driveForward(float stopX, bool useSensor) {
+  turnTo(0);
+  unsigned long lastProgress = millis();
+  float lastX = Enes100.getX();
+  while (true) {
+    float x = Enes100.getX();
+    float y = Enes100.getY();
+    if (x >= stopX - POS_TOL) {
+      stopMotors();
+      return REACHED;
+    }
+    if (useSensor && frontDistance() < DETECT_DIST) {
+      stopMotors();
+      return BLOCKED;
+    }
+    if (x > MAX_X && fabs(y - LIMBO_Y) > LIMBO_HALF_GAP) {
+      stopMotors();
+      return STUCK;  // about to hit the log/limbo frame
+    }
+    // Progress check: if x hasn't moved for 1.5 s we're pushing on something.
+    if (x > lastX + 0.02) {
+      lastX = x;
+      lastProgress = millis();
+    } else if (millis() - lastProgress > 1500) {
+      stopMotors();
+      return STUCK;
+    }
+    int pwm = DRIVE_PWM;
+    if (stopX - x < 0.1) pwm = SLOW_PWM;
+    float steer = STEER_GAIN * angleError(atan2(holdY - y, 0.4), Enes100.getTheta());
+    setMotors((int)(pwm - steer), (int)(pwm + steer));
   }
-  return false;
 }
 
-// One timed straight drive forward.
-void driveForward(float meters, float x, float y, float theta) {
-  if (meters < 0.02) return;
-  planMove(meters, DRIVE_PWM, DRIVE_M_PER_SEC);
-  rememberMove(2, x, y, theta);
-  timedMove(planPwm, planPwm, planSec);
-}
-
-// After a move, see how far it really went and update extraSec.
-// Returns false if we look stuck.
-bool learnFromLastMove(float x, float y, float theta) {
-  if (lastMoveKind == 0) return true;
-  float actual;
-  if (lastMoveKind == 1) {
-    actual = fabs(angleError(theta, moveStartTheta));
-  } else {
-    actual = sqrt((x - moveStartX) * (x - moveStartX) + (y - moveStartY) * (y - moveStartY));
+// Slide sideways: face +y or -y and drive until y reaches targetY,
+// holding the current x line.
+void moveToY(float targetY) {
+  float dy = targetY - Enes100.getY();
+  if (fabs(dy) < POS_TOL * 2) return;
+  float heading = PI / 2;
+  float sign = 1;
+  if (dy < 0) {
+    heading = -PI / 2;
+    sign = -1;
   }
-  float sample = actual / lastMoveRate - lastMoveSec;
-  if (sample < 0) sample = 0;
-  if (sample > 0.5) sample = 0.5;
-  extraSec = 0.6 * extraSec + 0.4 * sample;
-
-  bool ok = true;
-  float minExpected = 0.05;          // meters
-  if (lastMoveKind == 1) minExpected = 0.15;  // radians
-  if (lastMoveRate * lastMoveSec > minExpected &&
-      actual < 0.3 * lastMoveRate * lastMoveSec) {
-    // Moved the motors but barely moved: we're pushing on something.
-    stuckCount++;
-    ok = false;
-  } else if (lastMoveKind == 2) {
-    stuckCount = 0;
+  turnTo(heading);
+  float holdX = Enes100.getX();
+  unsigned long start = millis();
+  while (millis() - start < 6000) {
+    float y = Enes100.getY();
+    float toGo = (targetY - y) * sign;
+    if (toGo < POS_TOL) break;
+    int pwm = DRIVE_PWM;
+    if (toGo < 0.1) pwm = SLOW_PWM;
+    float lineErr = -sign * (holdX - Enes100.getX());
+    float steer = STEER_GAIN * (angleError(heading, Enes100.getTheta()) + 2.5 * lineErr);
+    setMotors((int)(pwm - steer), (int)(pwm + steer));
   }
-  lastMoveKind = 0;
-  return ok;
+  stopMotors();
 }
 
-// Back straight up (used to get unstuck or to get room to look again).
+// Back straight up a little (after bumping into something).
 void backUp(float meters) {
-  if (!ENABLE_MOTION) return;
-  timedMove(-DRIVE_PWM, -DRIVE_PWM, meters / DRIVE_M_PER_SEC);
-}
-
-void setState(int s) {
-  state = s;
-  sideMoves = 0;
-  Enes100.print("state=");
-  Enes100.println(s);
-}
-
-void stopPermanently(const char *reason) {
-  Tank.turnOffMotors();
-  if (!halted) {
-    Enes100.println(reason);
+  float x0 = Enes100.getX();
+  float y0 = Enes100.getY();
+  unsigned long start = millis();
+  setMotors(-SLOW_PWM, -SLOW_PWM);
+  while (millis() - start < 3000) {
+    float dx = Enes100.getX() - x0;
+    float dy = Enes100.getY() - y0;
+    if (sqrt(dx * dx + dy * dy) >= meters) break;
   }
-  halted = true; // Press stop + run again for another attempt.
+  stopMotors();
 }
 
-// No usable opening visible from here: slide one obstacle-width sideways
-// (toward the middle first) and look again from there.
-void blindSlide(float y) {
-  recoveries++;
-  if (recoveries > MAX_RECOVERIES) {
-    stopPermanently("Stopped: no opening found");
-    return;
+// Sweep slowly from forward toward side `dir` (+1 = +y, -1 = -y), watching
+// the sensor. Returns true if an opening was found; openStart / openEnd are
+// the headings where it started and ended, bounded says whether we saw the
+// far edge too.
+float openStart = 0;
+float openEnd = 0;
+bool bounded = false;
+bool scanSide(int dir) {
+  turnTo(0);
+  bool inOpening = false;
+  bounded = false;
+  if (dir > 0) {
+    setMotors(-SCAN_PWM, SCAN_PWM);
+  } else {
+    setMotors(SCAN_PWM, -SCAN_PWM);
   }
-  sideTargetY = y + scanFirstDir * BLIND_SIDESTEP;
-  if (sideTargetY < MIN_SIDE_Y || sideTargetY > MAX_SIDE_Y) {
-    sideTargetY = y - scanFirstDir * BLIND_SIDESTEP;
+  unsigned long start = millis();
+  while (millis() - start < 6000) {
+    float heading = angleError(Enes100.getTheta(), 0);
+    if (fabs(heading) > SCAN_MAX) break;
+    float d = frontDistance();
+    if (!inOpening && d > OPEN_DIST) {
+      inOpening = true;
+      openStart = heading;
+      openEnd = heading;
+    } else if (inOpening && d > CONFIRM_DIST) {
+      openEnd = heading;
+    } else if (inOpening) {
+      if (fabs(openEnd - openStart) > 0.08) {
+        bounded = true;
+        break;
+      }
+      inOpening = false;  // too narrow to be a real opening; keep looking
+    }
   }
-  if (sideTargetY < MIN_SIDE_Y) sideTargetY = MIN_SIDE_Y;
-  if (sideTargetY > MAX_SIDE_Y) sideTargetY = MAX_SIDE_Y;
-  Enes100.print("No opening in view, sliding to y=");
-  Enes100.println(sideTargetY);
-  setState(ST_SIDESTEP);
+  stopMotors();
+  return inOpening;
 }
 
-// Opening seen from openAngle to openEndAngle. If both edges were seen
-// (bounded), slide to its middle; otherwise slide just past its near edge.
-void finishOpening(bool bounded, float y) {
+// Work out how far to slide to line up with the opening just scanned.
+// Returns the target y, or -1 if the opening isn't usable.
+float openingTargetY(int dir, float objectDist, float y) {
   float d = objectDist + HALF_LENGTH;
   float side;
   if (bounded) {
-    side = d * (tan(fabs(openAngle)) + tan(fabs(openEndAngle))) / 2;
+    side = d * (tan(fabs(openStart)) + tan(fabs(openEnd))) / 2;
   } else {
-    side = d * tan(fabs(openAngle)) + SIDE_MARGIN;
+    side = d * tan(fabs(openStart)) + SIDE_MARGIN;
   }
-  sideTargetY = y + scanDir * side;
-  if (sideTargetY < MIN_SIDE_Y) sideTargetY = MIN_SIDE_Y;
-  if (sideTargetY > MAX_SIDE_Y) sideTargetY = MAX_SIDE_Y;
-  if (fabs(sideTargetY - y) < 0.15) {
-    // The "opening" is just the gap along the wall; we can't fit there.
-    blindSlide(y);
-    return;
-  }
-  Enes100.print("Opening found, side-stepping to y=");
-  Enes100.println(sideTargetY);
-  setState(ST_SIDESTEP);
+  float target = y + dir * side;
+  if (target < MIN_SIDE_Y) target = MIN_SIDE_Y;
+  if (target > MAX_SIDE_Y) target = MAX_SIDE_Y;
+  if (fabs(target - y) < 0.15) return -1;  // just the gap along a wall
+  return target;
 }
 
-void startScan(float y) {
-  // Try the side toward the middle of the arena first.
-  scanDir = 1;
-  if (y > MID_Y + 0.1) scanDir = -1;
-  if (fabs(y - MID_Y) <= 0.1 && LIMBO_Y < MID_Y) scanDir = -1;
-  scanFirstDir = scanDir;
-  scanSidesTried = 1;
-  scanAngle = 0;
-  scanSawOpen = false;
-  setState(ST_SCAN);
+// An object is ahead: find an opening and slide over to it.
+void getAroundObject() {
+  float objectDist = frontDistance();
+  float y = Enes100.getY();
+  Enes100.print("Object ahead at ");
+  Enes100.println(objectDist);
+
+  int firstDir = 1;
+  if (y > MID_Y + 0.1) firstDir = -1;
+
+  float target = -1;
+  if (scanSide(firstDir)) target = openingTargetY(firstDir, objectDist, y);
+  if (target < 0 && scanSide(-firstDir)) target = openingTargetY(-firstDir, objectDist, y);
+
+  if (target < 0) {
+    // Nothing usable in view: slide one obstacle-width and look again.
+    target = y + firstDir * BLIND_SIDESTEP;
+    if (target < MIN_SIDE_Y || target > MAX_SIDE_Y) target = y - firstDir * BLIND_SIDESTEP;
+    if (target < MIN_SIDE_Y) target = MIN_SIDE_Y;
+    if (target > MAX_SIDE_Y) target = MAX_SIDE_Y;
+    recoveries++;
+    Enes100.print("No opening in view, sliding to y=");
+  } else {
+    Enes100.print("Opening found, sliding to y=");
+  }
+  Enes100.println(target);
+  moveToY(target);
+  holdY = Enes100.getY();
 }
 
 void setup() {
@@ -294,172 +291,38 @@ void setup() {
   Tank.turnOffMotors();
   Enes100.println("CLEAR obstacle navigation ready");
   holdY = Enes100.getY();
-  setState(ST_FACE_FORWARD);
 }
 
 void loop() {
-  if (halted) {
-    Tank.turnOffMotors();
+  if (done) {
     delay(100);
     return;
   }
 
-  float x = Enes100.getX();
-  float y = Enes100.getY();
-  float theta = Enes100.getTheta();
-  if (!Enes100.isVisible() || x < 0.05 || x > 3.95 || y < 0.05 || y > 1.95) {
-    stopPermanently("Stopped: invalid pose");
-    return;
-  }
-  // Never touch the log/limbo frame: past MAX_X only while passing under the
-  // limbo and lined up with its opening.
-  bool passingLimbo = (state == ST_UNDER_LIMBO || state == ST_DONE);
-  if (x > MAX_X && (!passingLimbo || fabs(y - LIMBO_Y) > LIMBO_HALF_GAP)) {
-    stopPermanently("Stopped: too close to the log/limbo frame");
-    return;
-  }
-  if (!learnFromLastMove(x, y, theta)) {
-    // Bumped into something: back up and look for an opening again.
+  // 1. Drive forward until something is in the way or we're past the obstacles.
+  int result = driveForward(CLEAR_X, true);
+
+  if (result == BLOCKED) {
+    getAroundObject();
+  } else if (result == STUCK) {
     recoveries++;
-    if (recoveries > MAX_RECOVERIES) {
-      stopPermanently("Stopped: stuck too many times");
-      return;
-    }
     Enes100.println("Bumped something, backing up");
     backUp(0.15);
-    setState(ST_FACE_FORWARD);
+    getAroundObject();
+  } else {
+    // 2. Past the obstacles: line up with the limbo and drive under it.
+    Enes100.println("Past obstacles, lining up with the limbo");
+    moveToY(LIMBO_Y);
+    holdY = LIMBO_Y;
+    if (driveForward(GOAL_X, false) == REACHED) {
+      finish("Stopped: reached goal (under the limbo)");
+    } else {
+      finish("Stopped: could not get under the limbo");
+    }
     return;
   }
 
-  float front = frontDistance();
-
-  if (state == ST_FACE_FORWARD) {
-    if (turnTo(0, x, y, theta)) {
-      setState(ST_DRIVE);
-    }
-  } else if (state == ST_DRIVE) {
-    // Drive forward until something is in the way.
-    if (x > CLEAR_X) {
-      setState(ST_TO_LIMBO_Y);
-    } else if (front < DETECT_DIST) {
-      Enes100.print("Object ahead, front_m=");
-      Enes100.println(front);
-      objectDist = front;
-      startScan(y);
-    } else if (fabs(angleError(atan2(holdY - y, 0.5), theta)) > HEADING_TOL) {
-      // Steer back onto the y line we're holding so drift doesn't add up.
-      turnTo(atan2(holdY - y, 0.5), x, y, theta);
-    } else {
-      // Stop a little inside DETECT_DIST so there is room to look around.
-      float step = MAX_STEP;
-      if (front - (DETECT_DIST - 0.05) < step) step = front - (DETECT_DIST - 0.05);
-      if (CLEAR_X + 0.05 - x < step) step = CLEAR_X + 0.05 - x;
-      driveForward(step, x, y, theta);
-    }
-  } else if (state == ST_SCAN) {
-    // Turn a little at a time. Find where an opening starts (nothing within
-    // 1 m), keep turning to find where it ends, then slide to its middle.
-    bool canStep = fabs(scanAngle) + SCAN_STEP <= SCAN_MAX + 0.01;
-    if (!turnTo(scanAngle, x, y, theta)) {
-      // still turning to the current scan angle
-    } else if (!scanSawOpen && front > 1.0 && scanAngle != 0) {
-      scanSawOpen = true;
-      openAngle = scanAngle;
-      openEndAngle = scanAngle;
-      if (canStep) {
-        scanAngle = scanAngle + scanDir * SCAN_STEP;
-      } else {
-        finishOpening(false, y);
-      }
-    } else if (scanSawOpen && front > CONFIRM_DIST) {
-      openEndAngle = scanAngle;
-      if (canStep) {
-        scanAngle = scanAngle + scanDir * SCAN_STEP;
-      } else {
-        finishOpening(false, y);
-      }
-    } else if (scanSawOpen && openEndAngle != openAngle) {
-      // Blocked again: we have both edges of the opening.
-      finishOpening(true, y);
-    } else if (canStep) {
-      // Nothing yet (or the opening was too narrow): keep turning.
-      scanSawOpen = false;
-      scanAngle = scanAngle + scanDir * SCAN_STEP;
-    } else if (scanSidesTried < 2) {
-      // Nothing on this side; try the other side.
-      scanDir = -scanDir;
-      scanSidesTried = 2;
-      scanAngle = scanDir * SCAN_STEP;
-      scanSawOpen = false;
-    } else {
-      blindSlide(y);
-    }
-  } else if (state == ST_SIDESTEP) {
-    // Slide sideways (turn to face +y or -y, drive) to line up with the
-    // opening, then face forward and keep driving.
-    float dy = sideTargetY - y;
-    // Accept a looser line-up after a few tries so we don't wobble.
-    float tol = SIDE_TOL;
-    if (sideMoves >= 3) tol = Y_TOL;
-    if (fabs(dy) < tol) {
-      holdY = y;
-      setState(ST_FACE_FORWARD);
-    } else {
-      float facing = PI / 2;
-      if (dy < 0) facing = -PI / 2;
-      if (turnTo(facing, x, y, theta)) {
-        float step = fabs(dy);
-        if (step > MAX_STEP) step = MAX_STEP;
-        driveForward(step, x, y, theta);
-        sideMoves++;
-      }
-    }
-  } else if (state == ST_TO_LIMBO_Y) {
-    // Past the obstacles: side-step onto the limbo center line.
-    float dy = LIMBO_Y - y;
-    if (fabs(dy) < Y_TOL) {
-      setState(ST_FACE_LIMBO);
-    } else {
-      float facing = PI / 2;
-      if (dy < 0) facing = -PI / 2;
-      if (turnTo(facing, x, y, theta)) {
-        float step = fabs(dy);
-        if (step > MAX_STEP) step = MAX_STEP;
-        driveForward(step, x, y, theta);
-      }
-    }
-  } else if (state == ST_FACE_LIMBO) {
-    if (turnTo(0, x, y, theta)) {
-      setState(ST_UNDER_LIMBO);
-    }
-  } else if (state == ST_UNDER_LIMBO) {
-    // Straight under the limbo, holding y on its center line.
-    float remaining = GOAL_X - x;
-    if (remaining < 0.06) {
-      setState(ST_DONE);
-    } else {
-      float desired = atan2(LIMBO_Y - y, 0.4);
-      if (turnTo(desired, x, y, theta)) {
-        float step = MAX_STEP;
-        if (remaining < step) step = remaining;
-        driveForward(step, x, y, theta);
-      }
-    }
-  } else if (state == ST_DONE) {
-    stopPermanently("Stopped: reached goal (under the limbo)");
-    return;
-  }
-
-  // Printing is slow in the simulator, so only print pose every 5th loop.
-  loopCount++;
-  if (loopCount % 5 == 0) {
-    Enes100.print("x=");
-    Enes100.print(x);
-    Enes100.print(" y=");
-    Enes100.print(y);
-    Enes100.print(" theta=");
-    Enes100.print(theta);
-    Enes100.print(" front_m=");
-    Enes100.println(front);
+  if (recoveries > MAX_RECOVERIES) {
+    finish("Stopped: no way through found");
   }
 }

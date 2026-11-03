@@ -7,7 +7,8 @@
 //
 // Strategy: pick a lane, face +x, look ahead with the front ultrasonic.
 // If the lane is blocked, mark it, side-step to the nearest open lane and
-// look again. Once past both columns, drive to the goal point.
+// look again. Once past both columns, line up with the limbo and drive
+// straight under it to the goal.
 #include <math.h>
 #include "Arduino.h"
 #include "Enes100.h"
@@ -27,15 +28,20 @@ const int NUM_LANES = 3;
 // Once x passes this, all obstacles are behind us.
 const float CLEAR_X = 2.7;
 
-// The log / limbo wall spans x = 3.35 to 3.45. The tank must never reach it.
+// The log / limbo spans x = 3.35 to 3.45. Log is y = 0 to 1 (orange); the
+// limbo opening is y = 1.03 to 1.97 (white bar overhead). We go under the limbo.
 const float WALL_X = 3.35;
 const float HALF_LENGTH = 0.075;  // robot center to front, meters
-// Hard limit for the robot's center: front stays at least 10 cm from the wall.
+const float LIMBO_Y = 1.5;        // center of the limbo opening
+const float LIMBO_HALF_GAP = 0.3; // max allowed |y - LIMBO_Y| while passing under
+// Line up straight in front of the limbo here before going under.
+const float LIMBO_APPROACH_X = 3.0;
+// Hard limit for the robot's center unless lined up with the limbo.
 const float MAX_X = WALL_X - HALF_LENGTH - 0.10;
 
-// Goal point: stop in front of the wall (front of tank ~22 cm away).
-const float GOAL_X = 3.05;
-const float GOAL_Y = 1.5;
+// Final stop point past the limbo (right arena wall is at x = 4.0).
+const float GOAL_X = 3.7;
+const float GOAL_Y = LIMBO_Y;
 
 // Ultrasonic thresholds (meters, measured from the front of the robot).
 const float LOOK_DIST = 0.45;  // lane counts as blocked if something is this close
@@ -59,6 +65,8 @@ const int TURN_MAX_PWM = 85;
 #define ST_DRIVE_EAST 3
 #define ST_TO_GOAL 4
 #define ST_DONE 5
+#define ST_FACE_LIMBO 6
+#define ST_UNDER_LIMBO 7
 
 int state = ST_TO_LANE;
 int lane = 0;
@@ -241,8 +249,11 @@ void loop() {
     stopPermanently("Stopped: invalid pose");
     return;
   }
-  if (x > MAX_X) {
-    stopPermanently("Stopped: too close to the wall");
+  // Never touch the log/limbo frame: past MAX_X only while lined up with the
+  // limbo opening and in the pass-under states.
+  bool passingLimbo = (state == ST_UNDER_LIMBO || state == ST_DONE);
+  if (x > MAX_X && (!passingLimbo || fabs(y - LIMBO_Y) > LIMBO_HALF_GAP)) {
+    stopPermanently("Stopped: too close to the log/limbo frame");
     return;
   }
   float front = frontDistance();
@@ -295,11 +306,25 @@ void loop() {
       driveHeading(atan2(laneY(lane) - y, 0.3), theta, pwm);
     }
   } else if (state == ST_TO_GOAL) {
-    if (driveToPoint(GOAL_X, GOAL_Y, 0.10, x, y, theta)) {
+    // Get lined up in front of the limbo opening first.
+    if (driveToPoint(LIMBO_APPROACH_X, LIMBO_Y, 0.05, x, y, theta)) {
+      setState(ST_FACE_LIMBO);
+    }
+  } else if (state == ST_FACE_LIMBO) {
+    if (turnToward(0, theta)) {
+      setState(ST_UNDER_LIMBO);
+    }
+  } else if (state == ST_UNDER_LIMBO) {
+    // Straight through, holding y on the limbo center line.
+    if (x > GOAL_X - 0.05) {
       setState(ST_DONE);
+    } else if (x > GOAL_X - 0.3) {
+      timedMove(SLOW_PWM, SLOW_PWM, (GOAL_X - x) / SLOW_M_PER_SEC);
+    } else {
+      driveHeading(atan2(LIMBO_Y - y, 0.3), theta, SLOW_PWM);
     }
   } else if (state == ST_DONE) {
-    stopPermanently("Stopped: reached goal");
+    stopPermanently("Stopped: reached goal (under the limbo)");
     return;
   }
 

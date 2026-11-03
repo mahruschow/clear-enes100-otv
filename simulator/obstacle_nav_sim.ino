@@ -9,6 +9,10 @@
 // If the lane is blocked, mark it, side-step to the nearest open lane and
 // look again. Once past both columns, line up with the limbo and drive
 // straight under it to the goal.
+//
+// Every move is a timed turn or a timed straight drive (motors on, delay,
+// motors off), then the pose is re-checked. delay() is real time, so moves
+// are the same size no matter how slowly the simulator steps through code.
 #include <math.h>
 #include "Arduino.h"
 #include "Enes100.h"
@@ -34,36 +38,34 @@ const float WALL_X = 3.35;
 const float HALF_LENGTH = 0.075;  // robot center to front, meters
 const float LIMBO_Y = 1.5;        // center of the limbo opening
 const float LIMBO_HALF_GAP = 0.3; // max allowed |y - LIMBO_Y| while passing under
-// Line up straight in front of the limbo here before going under.
-const float LIMBO_APPROACH_X = 3.0;
 // Hard limit for the robot's center unless lined up with the limbo.
 const float MAX_X = WALL_X - HALF_LENGTH - 0.10;
 
 // Final stop point past the limbo (right arena wall is at x = 4.0).
 const float GOAL_X = 3.7;
-const float GOAL_Y = LIMBO_Y;
 
 // Ultrasonic thresholds (meters, measured from the front of the robot).
 const float LOOK_DIST = 0.45;  // lane counts as blocked if something is this close
-const float STOP_DIST = 0.30;  // stop driving if something gets this close
-const float SLOW_DIST = 0.70;  // slow down when something is this close
+const float STOP_DIST = 0.25;  // never drive closer than this to an obstacle
 
-// Motor tuning (simulator values; the real tank needs more turn power).
-const int DRIVE_PWM = 110;
-const int SLOW_PWM = 60;
-const int PULSE_TURN_PWM = 60;
+// Position / heading tolerances.
+const float Y_TOL = 0.06;        // meters
+const float HEADING_TOL = 0.06;  // radians (~3.5 degrees)
+const float MAX_STEP = 0.45;     // longest single straight move, meters
+
+// Motor tuning (simulator values; the real tank needs its own numbers).
+const int DRIVE_PWM = 220;
+const int TURN_PWM = 150;
 // Simulator motion model: speed = (L+R)/255/4 m/s, turn rate = (R-L)/255 rad/s.
-// On the real tank, measure these and replace them.
-const float SLOW_M_PER_SEC = 2.0 * SLOW_PWM / 255.0 / 4.0;
-const float TURN_RAD_PER_SEC = 2.0 * PULSE_TURN_PWM / 255.0;
-const int TURN_MIN_PWM = 45;
-const int TURN_MAX_PWM = 85;
+// On the real tank, measure these two and replace them.
+const float DRIVE_M_PER_SEC = 2.0 * DRIVE_PWM / 255.0 / 4.0;
+const float TURN_RAD_PER_SEC = 2.0 * TURN_PWM / 255.0;
 
 #define ST_TO_LANE 0
 #define ST_FACE_EAST 1
 #define ST_CHECK 2
 #define ST_DRIVE_EAST 3
-#define ST_TO_GOAL 4
+#define ST_TO_LIMBO_Y 4
 #define ST_DONE 5
 #define ST_FACE_LIMBO 6
 #define ST_UNDER_LIMBO 7
@@ -72,19 +74,15 @@ int state = ST_TO_LANE;
 int lane = 0;
 int blockedMask = 0;      // bit i set = lane i blocked in the current column
 float blockedAtX = 0;     // x where the current column's blocks were seen
-float laneChangeX = 0;    // x to hold while side-stepping between lanes
-
-// Motor command for this loop.
-int cmdLeft = 0;
-int cmdRight = 0;
 
 bool halted = false;
 int loopCount = 0;
-bool havePose = false;
-unsigned long lastPoseChangeMs = 0;
-float lastX = 0;
-float lastY = 0;
-float lastTheta = 0;
+
+// Stuck detection: a straight move that barely changes the pose.
+float moveStartX = 0;
+float moveStartY = 0;
+float lastStep = 0;
+int stuckCount = 0;
 
 float angleError(float desired, float current) {
   return atan2(sin(desired - current), cos(desired - current));
@@ -110,8 +108,7 @@ float frontDistance() {
   return d;
 }
 
-// Run the motors for a fixed time, then stop. delay() is real time, so this
-// works no matter how slowly the simulator steps through the code.
+// Run the motors for a fixed time, then stop.
 void timedMove(int left, int right, float seconds) {
   if (!ENABLE_MOTION) return;
   Tank.setLeftMotorPWM(left);
@@ -120,74 +117,43 @@ void timedMove(int left, int right, float seconds) {
   Tank.turnOffMotors();
 }
 
-// Spin in place toward a heading. Returns true once facing it.
-bool turnToward(float desired, float theta) {
+// One timed turn toward a heading. Returns true if already facing it.
+bool turnTo(float desired, float theta) {
   float error = angleError(desired, theta);
-  if (fabs(error) < 0.06) {
-    cmdLeft = 0;
-    cmdRight = 0;
-    return true;
-  }
-  if (fabs(error) < 0.6) {
-    // Small turn: timed pulse so we don't overshoot between loops.
-    float seconds = fabs(error) / TURN_RAD_PER_SEC;
-    if (error > 0) {
-      timedMove(-PULSE_TURN_PWM, PULSE_TURN_PWM, seconds);
-    } else {
-      timedMove(PULSE_TURN_PWM, -PULSE_TURN_PWM, seconds);
-    }
-    cmdLeft = 0;
-    cmdRight = 0;
-    return false;
-  }
-  float mag = fabs(error);
-  if (mag > 1.0) mag = 1.0;
-  int pwm = (int)(TURN_MIN_PWM + (TURN_MAX_PWM - TURN_MIN_PWM) * mag);
+  if (fabs(error) < HEADING_TOL) return true;
+  float seconds = fabs(error) / TURN_RAD_PER_SEC;
   if (error > 0) {
-    cmdLeft = -pwm;
-    cmdRight = pwm;
+    timedMove(-TURN_PWM, TURN_PWM, seconds);
   } else {
-    cmdLeft = pwm;
-    cmdRight = -pwm;
+    timedMove(TURN_PWM, -TURN_PWM, seconds);
   }
   return false;
 }
 
-// Drive while holding a heading; steers proportionally.
-void driveHeading(float desired, float theta, int pwm) {
-  float error = angleError(desired, theta);
-  if (fabs(error) > 0.5) {
-    turnToward(desired, theta);
-    return;
-  }
-  int steer = (int)(pwm * 0.7 * error);
-  cmdLeft = pwm - steer;
-  cmdRight = pwm + steer;
+// One timed straight drive forward.
+void driveForward(float meters, float x, float y) {
+  moveStartX = x;
+  moveStartY = y;
+  lastStep = meters;
+  timedMove(DRIVE_PWM, DRIVE_PWM, meters / DRIVE_M_PER_SEC);
 }
 
-// Drive to a point. Returns true when within tol.
-bool driveToPoint(float tx, float ty, float tol, float x, float y, float theta) {
-  float dx = tx - x;
-  float dy = ty - y;
-  float dist = sqrt(dx * dx + dy * dy);
-  if (dist < tol) {
-    cmdLeft = 0;
-    cmdRight = 0;
-    return true;
+// Side-step along y to targetY: face +y or -y, then drive straight.
+// Returns true once within Y_TOL.
+bool moveToY(float targetY, float y, float theta) {
+  float dy = targetY - y;
+  if (fabs(dy) < Y_TOL) return true;
+  float facing = PI / 2;
+  if (dy < 0) facing = -PI / 2;
+  if (turnTo(facing, theta)) {
+    float step = fabs(dy);
+    if (step > MAX_STEP) step = MAX_STEP;
+    driveForward(step, Enes100.getX(), y);
   }
-  float desired = atan2(dy, dx);
-  if (dist < 0.3) {
-    // Close: face the point, then a timed straight move onto it.
-    if (turnToward(desired, theta)) {
-      timedMove(SLOW_PWM, SLOW_PWM, dist / SLOW_M_PER_SEC);
-    }
-    return false;
-  }
-  driveHeading(desired, theta, DRIVE_PWM);
   return false;
 }
 
-// Choose the open lane closest to the current one (ties go toward the goal).
+// Choose the open lane closest to the current one (ties go toward the limbo).
 // Returns -1 if every lane is marked blocked.
 int pickOpenLane() {
   int best = -1;
@@ -200,7 +166,7 @@ int pickOpenLane() {
     int dNew = (int)abs(i - lane);
     int dBest = (int)abs(best - lane);
     if (dNew < dBest ||
-        (dNew == dBest && fabs(laneY(i) - GOAL_Y) < fabs(laneY(best) - GOAL_Y))) {
+        (dNew == dBest && fabs(laneY(i) - LIMBO_Y) < fabs(laneY(best) - LIMBO_Y))) {
       best = i;
     }
   }
@@ -227,11 +193,9 @@ void setup() {
   Enes100.begin("CLEAR", WATER, MARKER_ID, ROOM_NUMBER, 52, 50);
   Tank.begin();
   Tank.turnOffMotors();
-  lastPoseChangeMs = millis();
   Enes100.println("CLEAR obstacle navigation ready");
 
   lane = nearestLane(Enes100.getY());
-  laneChangeX = Enes100.getX();
   setState(ST_TO_LANE);
 }
 
@@ -249,17 +213,30 @@ void loop() {
     stopPermanently("Stopped: invalid pose");
     return;
   }
-  // Never touch the log/limbo frame: past MAX_X only while lined up with the
-  // limbo opening and in the pass-under states.
+  // Never touch the log/limbo frame: past MAX_X only while passing under the
+  // limbo and lined up with its opening.
   bool passingLimbo = (state == ST_UNDER_LIMBO || state == ST_DONE);
   if (x > MAX_X && (!passingLimbo || fabs(y - LIMBO_Y) > LIMBO_HALF_GAP)) {
     stopPermanently("Stopped: too close to the log/limbo frame");
     return;
   }
-  float front = frontDistance();
 
-  cmdLeft = 0;
-  cmdRight = 0;
+  // Stuck check: did the last straight move actually move us?
+  if (lastStep > 0.05) {
+    float moved = sqrt((x - moveStartX) * (x - moveStartX) + (y - moveStartY) * (y - moveStartY));
+    if (moved < 0.3 * lastStep) {
+      stuckCount++;
+      if (stuckCount >= 3) {
+        stopPermanently("Stopped: stuck (drive moves are not changing the pose)");
+        return;
+      }
+    } else {
+      stuckCount = 0;
+    }
+  }
+  lastStep = 0;
+
+  float front = frontDistance();
 
   // Forget old blocks once we are past the column they came from.
   if (blockedMask != 0 && x > blockedAtX + 0.5) {
@@ -267,12 +244,11 @@ void loop() {
   }
 
   if (state == ST_TO_LANE) {
-    // Side-step along y at a fixed x into the chosen lane.
-    if (driveToPoint(laneChangeX, laneY(lane), 0.05, x, y, theta)) {
+    if (moveToY(laneY(lane), y, theta)) {
       setState(ST_FACE_EAST);
     }
   } else if (state == ST_FACE_EAST) {
-    if (turnToward(0, theta)) {
+    if (turnTo(0, theta)) {
       setState(ST_CHECK);
     }
   } else if (state == ST_CHECK) {
@@ -288,49 +264,59 @@ void loop() {
       Enes100.print("Lane blocked, front_m=");
       Enes100.println(front);
       lane = next;
-      laneChangeX = x;
       setState(ST_TO_LANE);
     } else {
       setState(ST_DRIVE_EAST);
     }
   } else if (state == ST_DRIVE_EAST) {
     if (x > CLEAR_X) {
-      setState(ST_TO_GOAL);
-    } else if (front < STOP_DIST) {
-      Tank.turnOffMotors();
+      setState(ST_TO_LIMBO_Y);
+    } else if (front < STOP_DIST + 0.03) {
       setState(ST_CHECK);
     } else {
       // Aim slightly ahead on the lane center so drift gets corrected.
-      int pwm = DRIVE_PWM;
-      if (front < SLOW_DIST) pwm = SLOW_PWM;
-      driveHeading(atan2(laneY(lane) - y, 0.3), theta, pwm);
+      float desired = atan2(laneY(lane) - y, 0.4);
+      if (fabs(angleError(desired, theta)) > 0.12) {
+        turnTo(desired, theta);
+      } else {
+        float step = MAX_STEP;
+        if (front - STOP_DIST < step) step = front - STOP_DIST;
+        if (CLEAR_X + 0.05 - x < step) step = CLEAR_X + 0.05 - x;
+        driveForward(step, x, y);
+      }
     }
-  } else if (state == ST_TO_GOAL) {
-    // Get lined up in front of the limbo opening first.
-    if (driveToPoint(LIMBO_APPROACH_X, LIMBO_Y, 0.05, x, y, theta)) {
+  } else if (state == ST_TO_LIMBO_Y) {
+    // Past the obstacles: side-step onto the limbo center line.
+    if (moveToY(LIMBO_Y, y, theta)) {
       setState(ST_FACE_LIMBO);
     }
   } else if (state == ST_FACE_LIMBO) {
-    if (turnToward(0, theta)) {
+    if (turnTo(0, theta)) {
       setState(ST_UNDER_LIMBO);
     }
   } else if (state == ST_UNDER_LIMBO) {
-    // Straight through, holding y on the limbo center line.
-    if (x > GOAL_X - 0.05) {
+    // Straight under the limbo, holding y on its center line.
+    float remaining = GOAL_X - x;
+    if (remaining < 0.05) {
       setState(ST_DONE);
-    } else if (x > GOAL_X - 0.3) {
-      timedMove(SLOW_PWM, SLOW_PWM, (GOAL_X - x) / SLOW_M_PER_SEC);
     } else {
-      driveHeading(atan2(LIMBO_Y - y, 0.3), theta, SLOW_PWM);
+      float desired = atan2(LIMBO_Y - y, 0.4);
+      if (fabs(angleError(desired, theta)) > 0.12) {
+        turnTo(desired, theta);
+      } else {
+        float step = MAX_STEP;
+        if (remaining < step) step = remaining;
+        driveForward(step, x, y);
+      }
     }
   } else if (state == ST_DONE) {
     stopPermanently("Stopped: reached goal (under the limbo)");
     return;
   }
 
-  // Printing is slow in the simulator, so only print pose every 10th loop.
+  // Printing is slow in the simulator, so only print pose every 5th loop.
   loopCount++;
-  if (loopCount % 10 == 0) {
+  if (loopCount % 5 == 0) {
     Enes100.print("x=");
     Enes100.print(x);
     Enes100.print(" y=");
@@ -340,26 +326,4 @@ void loop() {
     Enes100.print(" front_m=");
     Enes100.println(front);
   }
-
-  // Stall guard: only while motors are commanded; a turn counts as progress.
-  bool commanded = cmdLeft != 0 || cmdRight != 0;
-  if (!commanded || !havePose || fabs(x - lastX) > 0.02 || fabs(y - lastY) > 0.02 ||
-      fabs(angleError(theta, lastTheta)) > 0.05) {
-    havePose = true;
-    lastX = x;
-    lastY = y;
-    lastTheta = theta;
-    lastPoseChangeMs = millis();
-  } else if (ENABLE_MOTION && millis() - lastPoseChangeMs > 2500) {
-    stopPermanently("Stopped: no pose change for 2.5 seconds");
-    return;
-  }
-
-  if (ENABLE_MOTION && commanded) {
-    Tank.setLeftMotorPWM(cmdLeft);
-    Tank.setRightMotorPWM(cmdRight);
-  } else {
-    Tank.turnOffMotors();
-  }
-  delay(20);
 }

@@ -27,8 +27,14 @@ const int NUM_LANES = 3;
 // Once x passes this, all obstacles are behind us.
 const float CLEAR_X = 2.7;
 
-// Goal point. y = 1.5 goes under the limbo, y = 0.5 goes over the log.
-const float GOAL_X = 3.7;
+// The log / limbo wall spans x = 3.35 to 3.45. The tank must never reach it.
+const float WALL_X = 3.35;
+const float HALF_LENGTH = 0.075;  // robot center to front, meters
+// Hard limit for the robot's center: front stays at least 10 cm from the wall.
+const float MAX_X = WALL_X - HALF_LENGTH - 0.10;
+
+// Goal point: stop in front of the wall (front of tank ~22 cm away).
+const float GOAL_X = 3.05;
 const float GOAL_Y = 1.5;
 
 // Ultrasonic thresholds (meters, measured from the front of the robot).
@@ -233,6 +239,10 @@ void loop() {
   float theta = Enes100.getTheta();
   if (!Enes100.isVisible() || x < 0.05 || x > 3.95 || y < 0.05 || y > 1.95) {
     stopPermanently("Stopped: invalid pose");
+    return;
+  }
+  if (x > MAX_X) {
+    stopPermanently("Stopped: too close to the wall");
     return;
   }
   float front = frontDistance();

@@ -37,7 +37,7 @@ const float GOAL_X = 3.7;     // final stop, past the limbo
 const float COL1_MAX = 0.5;   // survey reading closer than this = column 1
 
 // Tolerances.
-const float HEADING_TOL = 0.05;  // radians (~3 degrees)
+const float HEADING_TOL = 0.07;  // radians (~4 degrees)
 const float POS_TOL = 0.03;      // meters
 
 // Motor power and the speeds it gives in the simulator
@@ -223,6 +223,26 @@ void setup() {
   Tank.begin();
   Tank.turnOffMotors();
   Enes100.println("CLEAR obstacle navigation ready");
+
+  // Measure how fast the simulator is running this code.
+  unsigned long t0 = millis();
+  int n = 0;
+  n++;
+  n++;
+  n++;
+  n++;
+  n++;
+  n++;
+  n++;
+  n++;
+  n++;
+  n++;
+  int msPerLine = (int)((millis() - t0) / 10);
+  Enes100.print("Simulator speed: ms per line = ");
+  Enes100.println(msPerLine);
+  if (msPerLine > 40) {
+    Enes100.println("TOO SLOW: stop, click the speed button until it says instant, run again");
+  }
 }
 
 void loop() {
@@ -232,12 +252,14 @@ void loop() {
   }
 
   // 1. Drive straight up to column 1.
+  Enes100.println("Driving to column 1");
   if (!driveTo(true, SURVEY_X)) {
     finish("Stopped: something in the way before column 1");
     return;
   }
 
   // 2. Survey: the lane we're in, then the middle, then the last if needed.
+  Enes100.println("At column 1, checking lanes");
   float y = Enes100.getY();
   int first = 0;
   if (fabs(laneY(1) - y) < fabs(laneY(first) - y)) first = 1;

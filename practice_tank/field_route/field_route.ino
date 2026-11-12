@@ -9,6 +9,8 @@ const float POOL_X=.55, INTAKE_REACH=.20; // practice docking targets, in meters
 const float SURVEY=1.19, GAP=1.90, CLEAR_X=2.72;
 const float LANE[]={.50,1.00,1.50};
 const int POWER=180; // both wheels worked at this PWM in the bench test
+// First upload: direction check only. Enable route only after a PASS.
+const bool CHECK_ONLY=true;
 bool done=false;
 float px,py,th;
 bool pose(){
@@ -20,16 +22,12 @@ bool fail(const char* why){
   Tank.turnOffMotors(); Enes100.println(why); return false;
 }
 bool recoverPose(){
-  Tank.turnOffMotors();
-  Enes100.println("PAUSED: waiting for marker 10");
-  unsigned long since=millis();
-  int good=0;
-  while(millis()-since<10000UL){
-    delay(250);
-    if(pose()) good++; else good=0;
-    if(good>=3){Enes100.println("Tracking restored; resuming");return true;}
-  }
-  return fail("STOP: tracking unavailable; reposition and restart");
+  return fail("STOP: lost pose; reset in start square");
+}
+bool inside(){return px>.25 && px<3.78 && py>.25 && py<1.75;}
+bool clearFront(){
+  float r=Tank.readDistanceSensor(1);
+  return isfinite(r) && r>=.15;
 }
 // Stop BEFORE asking Wi-Fi for another reading. No motor is left running
 // if a vision request stalls. Each step is corrected from the measured pose.
@@ -48,6 +46,7 @@ bool steer(float x,float y,bool rotateOnly,float angle){
       start+=millis()-paused;
       mode=-1;
     }
+    if(!inside()) return fail("STOP: marker too near arena edge");
     float dx=x-px,dy=y-py,d=sqrt(dx*dx+dy*dy);
     if(!rotateOnly && d<.04) return true;
     float e=wrap((rotateOnly?angle:atan2(dy,dx))-th);
@@ -61,12 +60,34 @@ bool steer(float x,float y,bool rotateOnly,float angle){
       int p=e>0?POWER:-POWER;
       pulse(-p,p,fabs(e)>.4?110:55);
     }else{
-      float r=Tank.readDistanceSensor(1);
-      if(r>0 && r<.10) return fail("STOP: obstacle within 10 cm");
+      if(!clearFront()) return fail("STOP: front range too close or invalid");
       pulse(POWER,POWER,d>.22?140:65);
     }
   }
   return fail("STOP: waypoint timeout");
+}
+bool directionCheck(){
+  if(!pose() || !inside() || px<.40 || px>.70 || fabs(py-1)>.65)
+    return fail("CHECK: reset at center of a starting square");
+  float x0=px,y0=py,h0=th;
+  if(fabs(h0)>.25) return fail("CHECK: aim sensor toward +X; marker theta must be near zero");
+  if(!clearFront()) return fail("CHECK: front range too close or invalid");
+  pulse(POWER,POWER,180);
+  delay(400);
+  if(!pose() || !inside()) return fail("CHECK: lost pose or edge after forward pulse");
+  float dx=px-x0,dy=py-y0;
+  Enes100.print("Forward dx m: ");Enes100.println(dx);
+  if(dx<.012 || fabs(dy)>dx || fabs(wrap(th-h0))>.22)
+    return fail("CHECK: forward motion unconfirmed; inspect tracks and marker alignment");
+  x0=px;y0=py;h0=th;
+  pulse(-POWER,POWER,150);
+  delay(400);
+  if(!pose() || !inside()) return fail("CHECK: lost pose or edge after turn");
+  float dh=wrap(th-h0);
+  Enes100.print("Left turn radians: ");Enes100.println(dh);
+  if(dh<.04 || dh>.9 || hypot(px-x0,py-y0)>.06) return fail("CHECK: left turn unconfirmed");
+  Enes100.println("CHECK PASS: forward and left verified");
+  return true;
 }
 bool go(float x,float y){return steer(x,y,false,0);}
 bool face(float a){return steer(0,0,true,a);}
@@ -119,6 +140,6 @@ void loop(){
   if(done) {delay(100);return;}
   if(!pose()) {delay(250);return;} // Wait for camera at startup; USB not required.
   done=true;
-  route();
+  if(directionCheck() && !CHECK_ONLY) route();
   Tank.turnOffMotors();
 }

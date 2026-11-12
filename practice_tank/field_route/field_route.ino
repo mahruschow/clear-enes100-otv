@@ -4,7 +4,7 @@
 #include "Tank.h"
 #include "Enes100.h"
 
-const int MARKER_ID=3, ROOM_NUMBER=1116; // EDIT to match tank and arena.
+const int MARKER_ID=10, ROOM_NUMBER=1116; // EDIT to match tank and arena.
 const float POOL_X=.55, INTAKE_REACH=.20; // practice docking targets, in meters
 const float SURVEY=1.19, GAP=1.90, CLEAR_X=2.72;
 const float LANE[]={.50,1.00,1.50};
@@ -19,6 +19,18 @@ bool pose(){
 bool fail(const char* why){
   Tank.turnOffMotors(); Enes100.println(why); return false;
 }
+bool recoverPose(){
+  Tank.turnOffMotors();
+  Enes100.println("PAUSED: waiting for marker 10");
+  unsigned long since=millis();
+  int good=0;
+  while(millis()-since<10000UL){
+    delay(250);
+    if(pose()) good++; else good=0;
+    if(good>=3){Enes100.println("Tracking restored; resuming");return true;}
+  }
+  return fail("STOP: tracking unavailable; reposition and restart");
+}
 // Stop BEFORE asking Wi-Fi for another reading. No motor is left running
 // if a vision request stalls. Each step is corrected from the measured pose.
 void pulse(int left,int right,int ms){
@@ -30,7 +42,12 @@ bool steer(float x,float y,bool rotateOnly,float angle){
   unsigned long start=millis();
   float best=100; int stale=0,mode=-1;
   while(millis()-start<45000UL){
-    if(!pose()) return fail("STOP: marker lost");
+    if(!pose()){
+      unsigned long paused=millis();
+      if(!recoverPose()) return false;
+      start+=millis()-paused;
+      mode=-1;
+    }
     float dx=x-px,dy=y-py,d=sqrt(dx*dx+dy*dy);
     if(!rotateOnly && d<.04) return true;
     float e=wrap((rotateOnly?angle:atan2(dy,dx))-th);
@@ -66,7 +83,7 @@ int scan(){
   return nearVotes>=4?1:(farVotes>=4?2:0);
 }
 bool route(){
-  if(!pose()) return fail("STOP: no starting pose");
+  if(!pose() && !recoverPose()) return false;
   if(px>1 || fabs(py-1)<.15) return fail("STOP: place tank in a starting square and reset");
   bool upper=py>1;
   float dock=upper?.50+INTAKE_REACH:1.50-INTAKE_REACH;

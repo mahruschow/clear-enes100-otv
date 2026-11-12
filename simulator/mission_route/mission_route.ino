@@ -221,8 +221,7 @@ int closestLane(int a, int b, float y) {
 // Simulator practice coordinates, NOT measured pool coordinates.
 // Example: pool center (0.55, 1.50), front intake 0.20 m ahead of marker.
 const float DOCK_X = 0.55;
-const float DOCK_Y = 1.30;
-const float DOCK_HEADING = PI / 2;
+// Example pool centers: Y=0.50 or 1.50; intake reach=0.20 m.
 const float EXIT_Y = 1.00;
 
 bool missionLeg(bool alongX, float goal) {
@@ -240,17 +239,30 @@ bool missionLeg(bool alongX, float goal) {
 }
 
 bool visitMission() {
-  if (!Enes100.isVisible()) return false;
-  // Only use this example approach from the lower starting square.
-  if (Enes100.getY() > EXIT_Y || Enes100.getX() >= SURVEY_X) return false;
-  if (!missionLeg(true, DOCK_X) || !missionLeg(false, DOCK_Y)) return false;
-  if (!missionLeg(true, DOCK_X) || !missionLeg(false, DOCK_Y)) return false;
-  turnTo(DOCK_HEADING);
-  Tank.turnOffMotors();
-  if (!Enes100.isVisible() ||
-      fabs(Enes100.getX() - DOCK_X) > POS_TOL ||
-      fabs(Enes100.getY() - DOCK_Y) > POS_TOL ||
-      fabs(angleError(DOCK_HEADING, Enes100.getTheta())) > HEADING_TOL) return false;
+  if (!Enes100.isVisible()) { Enes100.println("Mission: marker not visible"); return false; }
+  float startY = Enes100.getY();
+  if (Enes100.getX() >= SURVEY_X || fabs(startY - EXIT_Y) < 0.15) {
+    Enes100.println("Mission: reset in either starting square"); return false;
+  }
+  bool upperStart = startY > EXIT_Y;
+  float dockY = upperStart ? 0.70 : 1.30;
+  float dockHeading = upperStart ? -PI / 2 : PI / 2;
+  Enes100.print("Mission target Y: "); Enes100.println(dockY);
+  bool aligned = false;
+  for (int attempt = 0; attempt < 3; attempt++) {
+    if (!missionLeg(true, DOCK_X) || !missionLeg(false, dockY)) {
+      Enes100.println("Mission: failed to reach dock position"); return false;
+    }
+    turnTo(dockHeading);
+    Tank.turnOffMotors();
+    if (!Enes100.isVisible()) { Enes100.println("Mission: lost marker at dock"); return false; }
+    if (fabs(Enes100.getX() - DOCK_X) <= POS_TOL &&
+        fabs(Enes100.getY() - dockY) <= POS_TOL &&
+        fabs(angleError(dockHeading, Enes100.getTheta())) <= HEADING_TOL) {
+      aligned = true; break;
+    }
+  }
+  if (!aligned) { Enes100.println("Mission: dock alignment outside tolerance"); return false; }
   Enes100.println("MISSION STOP: motors off");
   delay(3000); // Visual demo only. Hardware must wait for sampling and arm retraction.
   Enes100.println("Leaving mission site");

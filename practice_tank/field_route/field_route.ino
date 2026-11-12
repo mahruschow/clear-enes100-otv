@@ -67,18 +67,24 @@ bool steer(float x,float y,bool rotateOnly,float angle){
   return fail("STOP: waypoint timeout");
 }
 bool directionCheck(){
-  if(!pose() || !inside() || px<.40 || px>.70 || fabs(py-1)>.65)
-    return fail("CHECK: reset at center of a starting square");
+  if(!pose() || px<0.20f || px>0.70f || fabs(py-1)>.65)
+    return fail("CHECK: start X must be 0.20-0.70 m; check starting Y");
   float x0=px,y0=py,h0=th;
   if(fabs(h0)>.25) return fail("CHECK: aim sensor toward +X; marker theta must be near zero");
   if(!clearFront()) return fail("CHECK: front range too close or invalid");
+  for(int n=0;n<5;n++){
+  if(!clearFront()) return fail("CHECK: front blocked");
   pulse(POWER,POWER,180);
   delay(400);
-  if(!pose() || !inside()) return fail("CHECK: lost pose or edge after forward pulse");
+  if(!pose() || px<0.20f || px>1.0 || py<=.25 || py>=1.75) return fail("CHECK: lost pose or edge after forward pulse");
   float dx=px-x0,dy=py-y0;
   Enes100.print("Forward dx m: ");Enes100.println(dx);
   if(dx<.012 || fabs(dy)>dx || fabs(wrap(th-h0))>.22)
     return fail("CHECK: forward motion unconfirmed; inspect tracks and marker alignment");
+  if(inside()) break; // Move inward before turning; keep route wall margin.
+  x0=px;y0=py;
+  }
+  if(!inside()) return fail("CHECK: insufficient clearance to turn");
   x0=px;y0=py;h0=th;
   pulse(-POWER,POWER,150);
   delay(400);
